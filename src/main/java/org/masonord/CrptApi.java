@@ -1,13 +1,6 @@
 package org.masonord;
 
 import com.google.gson.Gson;
-import org.bouncycastle.cert.jcajce.JcaCertStore;
-import org.bouncycastle.cms.CMSProcessableByteArray;
-import org.bouncycastle.cms.CMSSignedData;
-import org.bouncycastle.cms.CMSSignedDataGenerator;
-import org.bouncycastle.cms.jcajce.JcaSignerInfoGeneratorBuilder;
-import org.bouncycastle.operator.ContentSigner;
-import org.bouncycastle.operator.DigestCalculatorProvider;
 import java.io.IOException;
 import java.io.InputStream;
 import java.net.URI;
@@ -16,53 +9,65 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.security.*;
-import java.security.cert.CertificateException;
 import java.security.cert.X509Certificate;
+import java.time.Duration;
+import java.time.Instant;
 import java.util.*;
-import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
+
 public class CrptApi {
     private static final String createDocumentUrl = "https://ismp.crpt.ru/api/v3/lk/documents/create";
+    private static final long requestLimit = Long.parseLong(Environment.getValue("request.limit"));
+    private static final long refillPeriod = Long.parseLong(Environment.getValue("refill.period"));
+    private static TokenBucketRateLimiter rateLimiter;
+    private static String signature;
 
     /**
-     * RateLimiter, as the name suggest, is created to limit amount of request per each tread
+     * The TokenBucketRateLimiter, as the name suggests, is created to limit the number of requests per tread
      */
 
-    class RateLimiter {
-        private final int REQUEST_LIMIT;
-        private final long TIME_LIMIT;
-        private final Map<String, Queue<Long>> clientHitQ;
+    static class TokenBucketRateLimiter {
+        private final long capacity;
+        private final AtomicLong tokens;
+        private final Duration refillPeriod;
+        private volatile Instant lastRefillTime;
 
-        RateLimiter(long timeLimit, int requestLimit) {
-            this.REQUEST_LIMIT = requestLimit;
-            this.TIME_LIMIT = timeLimit;
-            this.clientHitQ = new ConcurrentHashMap<>();
+        public TokenBucketRateLimiter(long capacity, Duration refillPeriod) {
+            this.capacity = capacity;
+            this.tokens = new AtomicLong(capacity);
+            this.refillPeriod = refillPeriod;
+            this.lastRefillTime = Instant.now();
         }
-        public synchronized boolean isAllow(String client_id) {
-            Queue<Long> q = clientHitQ.get(client_id);
-            long curTime = System.currentTimeMillis();
-            if (q == null) {
-                q = new LinkedList<Long>();
-                clientHitQ.put(client_id, q);
-            }
-            while (!q.isEmpty() && curTime - q.peek() >= TIME_LIMIT) {
-                q.poll();
-            }
 
-            if (q.size() < REQUEST_LIMIT) {
-                q.offer(curTime);
+        public synchronized boolean isAllowed() {
+            refillTokens();
+
+            long currentTokens = tokens.get();
+            if (currentTokens > 0) {
+                tokens.decrementAndGet();
                 return true;
             }
 
             return false;
         }
+
+        private synchronized void refillTokens() {
+            Instant now = Instant.now();
+            long timeElapsed = Duration.between(lastRefillTime, now).toMillis();
+            long tokensToAdd = timeElapsed / refillPeriod.toMillis();
+
+            if (tokensToAdd > 0) {
+                lastRefillTime = now;
+                tokens.getAndUpdate(currentTokens -> Math.min(capacity, currentTokens + tokensToAdd));
+            }
+        }
     }
 
     /**
-     * Environment class is responsible for fetching values from a properties file
+     * The environment class is responsible for fetching values from a properties file.
      */
 
-    class Environment {
+    static class Environment {
         private static final Properties properties = new Properties();
 
         static {
@@ -83,20 +88,23 @@ public class CrptApi {
         }
     }
 
+    /**
+     *
+     * The authorization class takes care of delivering the JWT authorization token.
+     *
+     */
+
     class Authorization {
         private static final String certKeyUrl = "https://ismp.crpt.ru/api/v3/auth/cert/key";
         private static final String authCertUrl = "https://ismp.crpt.ru/api/v3/auth/cert/";
         private static final byte[] certificatePassword = Environment.getValue("certificate.password").getBytes();
         private static final String certificateName = Environment.getValue("certificate.name");
+
         private static class TokenResponse {
             private String encodedTokenBase64;
 
             public void setEncodedTokenBase64(String encodedTokenBase64) {
                 this.encodedTokenBase64 = encodedTokenBase64;
-            }
-
-            public String getEncodedTokenBase64() {
-                return encodedTokenBase64;
             }
         }
 
@@ -127,17 +135,14 @@ public class CrptApi {
 
         }
 
-
-        // -------------------------- Http Part --------------------------
-
         /**
          * Http Part
          *
-         * The class is responsible for sending/accepting http requests and response
-         * Particularly:
-         *  - Get random uuid and data
-         *  - Send obtained uuid and signed data
-         *  - Get JWT authorization token
+         *  The class is responsible for sending and accepting HTTP requests and responses.
+         *  Particularly:
+         *      - Get random uuids and data.
+         *      - Send obtained uuid and signed data.
+         *      - Get a JWT authorization token.
          *
          */
 
@@ -159,8 +164,13 @@ public class CrptApi {
                 return jsonResponse;
             }
 
-            private static TokenResponse getJWTToken(DataResponse dataResponse) throws URISyntaxException, IOException, InterruptedException {
-                String signature = "dummy signature";
+            private static TokenResponse getJWTToken(DataResponse dataResponse) throws Exception {
+                byte[] byteSignature = MakeSignature.signMessage(
+                        dataResponse.getData().getBytes(),
+                        MakeSignature.getCertificate(certificateName),
+                        MakeSignature.getPrivateKey(certificateName, certificatePassword)
+                );
+                signature = Base64.getEncoder().encodeToString(byteSignature);
 
                 TokenRequest tokenRequest = new TokenRequest();
                 tokenRequest.setUuid(dataResponse.getUuid());
@@ -185,11 +195,11 @@ public class CrptApi {
         /**
          * Signature Part
          *
-         * The class was initially created to signe a data by the chose certificate
+         * The class was initially created to sign a data by the chose certificate
          *
          */
 
-        class Signature {
+        class MakeSignature {
             private static X509Certificate getCertificate(String certificateName) throws  Exception {
                 KeyStore keyStore = KeyStore.getInstance("Windows-MY");
                 keyStore.load(null, null);
@@ -204,60 +214,125 @@ public class CrptApi {
                     }
                 }
 
-                throw new Exception("Certificate not found");
-
-            }
-            private static byte[] signMessage(byte[] message, X509Certificate certificate, PrivateKey privateKey) throws Exception {
-                CMSSignedDataGenerator generator = new CMSSignedDataGenerator();
-                generator.addSignerInfoGenerator(new JcaSignerInfoGeneratorBuilder(
-                        (DigestCalculatorProvider) new JcaCertStore(Collections.singletonList(certificate)))
-                        .setDirectSignature(true)
-                        .build((ContentSigner) privateKey, certificate));
-
-                List<X509Certificate> certList = new ArrayList<>();
-                certList.add(certificate);
-                generator.addCertificates(new JcaCertStore(certList));
-
-                CMSProcessableByteArray content = new CMSProcessableByteArray(message);
-                CMSSignedData signedData = generator.generate(content, false);
-
-                return signedData.getEncoded();
+                throw new RuntimeException("Certificate not found");
             }
 
-            private static PrivateKey getPrivateKey(String aliasName, String password) throws KeyStoreException, UnrecoverableKeyException, NoSuchAlgorithmException, CertificateException, IOException {
-                KeyStore keyStore = KeyStore.getInstance("Windows-ROOT");
+            private static PrivateKey getPrivateKey(String aliasName, byte[] password) throws Exception {
+                KeyStore keyStore = KeyStore.getInstance("Windows-MY");
                 keyStore.load(null, null);
 
-                PrivateKey privateKey = (PrivateKey) keyStore.getKey(aliasName, password.toCharArray());
+                PrivateKey privateKey = (PrivateKey) keyStore.getKey(aliasName, null);
 
                 if (privateKey != null)
                     return privateKey;
 
                 throw new RuntimeException("Private has not been found");
             }
+
+            private static byte[] signMessage(byte[] message, X509Certificate certificate, PrivateKey privateKey) throws Exception {
+                KeyStore keyStore = KeyStore.getInstance("Windows-MY");
+                keyStore.load(null, null);
+
+                Provider p = keyStore.getProvider();
+                Signature sig = Signature.getInstance("SH1withRSA", p);
+                sig.initSign(privateKey);
+                sig.update(message);
+
+                return sig.sign();
+            }
         }
     }
 
-    public CrptApi(TimeUnit timeUnit, int requestLimit) {
+    static class CreateDocumentRequest {
+        String document_format;
+        String product_document;
+        String product_group;
+        String signature;
+        String type;
 
+
+        public String getDocument_format() {
+            return document_format;
+        }
+
+        public String getProduct_document() {
+            return product_document;
+        }
+
+        public String getProduct_group() {
+            return product_group;
+        }
+
+        public String getSignature() {
+            return signature;
+        }
+
+        public String getType() {
+            return type;
+        }
+
+        public void setDocument_format(String document_format) {
+            this.document_format = document_format;
+        }
+
+        public void setProduct_document(String product_document) {
+            this.product_document = product_document;
+        }
+
+        public void setProduct_group(String product_group) {
+            this.product_group = product_group;
+        }
+
+        public void setSignature(String signature) {
+            this.signature = signature;
+        }
+
+        public void setType(String type) {
+            this.type = type;
+        }
     }
 
-    public void createDocument(String document, String jwtToken) throws IOException, InterruptedException, URISyntaxException {
-        Gson gson = new Gson();
+    public CrptApi() {
+        rateLimiter = new TokenBucketRateLimiter(
+                requestLimit,
+                Duration.ofSeconds(refillPeriod)
+        );
+    }
 
-        HttpRequest request = HttpRequest.newBuilder()
-                .uri(new URI(createDocumentUrl))
-                .header("Content-Type", "application/json")
-                .header("Authorization", "Bearer " + jwtToken)
-                .POST(HttpRequest.BodyPublishers.ofString(gson.toJson(document)))
-                .build();
+    public static void createDocument(CreateDocumentRequest document, String jwtToken) throws IOException, InterruptedException, URISyntaxException {
+        if (rateLimiter.isAllowed()) {
+            Gson gson = new Gson();
 
-        HttpResponse<String> response = HttpClient.newBuilder()
-                .build()
-                .send(request, HttpResponse.BodyHandlers.ofString());
+            HttpRequest request = HttpRequest.newBuilder()
+                    .uri(new URI(createDocumentUrl))
+                    .header("Content-Type", "application/json")
+                    .header("Authorization", "Bearer " + jwtToken)
+                    .POST(HttpRequest.BodyPublishers.ofString(gson.toJson(document)))
+                    .build();
+
+            HttpResponse<String> response = HttpClient.newBuilder()
+                    .build()
+                    .send(request, HttpResponse.BodyHandlers.ofString());
+        }
+
+        System.out.println("Too Many Request !!!");
+
     }
 
     public static void main(String[] args) throws Exception {
+        CrptApi api = new CrptApi();
+        CreateDocumentRequest newDocument = new CreateDocumentRequest();
+        newDocument.setDocument_format("json");
+        newDocument.setProduct_document("product 1");
+        newDocument.setType("AGGREGATION_DOCUMENT");
+        newDocument.setProduct_group("group 1");
+        newDocument.setSignature(signature);
 
+        createDocument(
+                newDocument,
+                Authorization.GetJwtToken.getJWTToken(
+                        Authorization.GetJwtToken.getDataAndUuid()
+                ).encodedTokenBase64
+        );
     }
 }
